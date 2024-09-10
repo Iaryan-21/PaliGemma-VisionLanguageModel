@@ -24,8 +24,9 @@ def resize(image: Image, size: Tuple[int,int], resample: Image.Resampling =None,
     return resized_image
 
 # Converts pixel values between 0 and 1 by multiplying by scale which is defined to be 1/255.0 further in the pipeline
-def rescale(image: np.ndarray, scale: float, dtype: np.dtype = np.float32) -> np.ndarray:
-    rescaled_image = image * scale
+
+def rescale(image: np.ndarray, rescale_factor: float, dtype: np.dtype = np.float32) -> np.ndarray:
+    rescaled_image = image * rescale_factor
     rescaled_image = rescaled_image.astype(dtype)
     return rescaled_image
 
@@ -46,7 +47,7 @@ def process_image(images: List[Image.Image],
                   ) -> List[np.ndarray]:
     height, width = size[0], size[1]
     images = [resize(image=image, size=(height,width),resample=resample) for image in images]
-    images = [np.array(image) for images in images] # Converting into a numpy array
+    images = [np.array(image) for image in images] # Converting into a numpy array
     images = [rescale(image, scale=rescale_factor) for image in images] # Pixel values instead of being between 0 and 255 become between 0 and 1
     images = [normalize(image, mean=image_mean, std=image_std) for image in images] # Normalizing the images uisng mean and standard deviation 
     images = [image.transpose(2,0,1) for image in images] # channel dimesnion to first dimension. [Channel, Height, Width]
@@ -81,9 +82,9 @@ class PaliGemmaProcessor:
     
         pixel_values = process_image(
             images,
-            size=(self.image_size, self.image_size),
+            size = (self.image_size, self.image_size),
             resample = Image.Resampling.BICUBIC,
-            resacle_factor = 1/255.0,
+            rescale_factor = 1/255.0,
             image_mean = IMAGENET_STANDARD_MEAN,
             image_std = IMAGENET_STANDARD_STD,    
         )
@@ -106,4 +107,3 @@ class PaliGemmaProcessor:
 
         return return_data
     
-
