@@ -1,4 +1,3 @@
-from turtle import forward, hideturtle
 from typing import Optional, Tuple 
 import torch 
 import torch.nn as nn 
@@ -57,7 +56,7 @@ class SigLipVisionEmbeddings(nn.Module):
         #[Batch_Size, Num_Patches, Embed_Dim]
         return embeddings
         
-class SigLipEncoder(nn.Module):
+class SigLipEncoderLayer(nn.Module):
     def __init__(self, config: SigLipVisionConfig):
         self.embed_dim = config.hidden_size
         self.self_attention = SigLipAttention(config)
@@ -75,6 +74,22 @@ class SigLipEncoder(nn.Module):
         hidden_states = self.mlp(hidden_states) # Transforms each of the layers independently
         hidden_states = hidden_states + residual_2
         
+        return hidden_states
+    
+class SigLipEncoder(nn.Module):
+    def __init__(self, config: SigLipVisionConfig):
+        super().__init__()
+        self.config = config
+        self.layers = config
+        self.layers = nn.ModuleList(
+            [SigLipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        
+    def forward(self, input_embeds : torch.Tensor) -> torch.Tensor:
+        hidden_states = input_embeds
+        for encoder_layer in self.layers:
+            hidden_states = encoder_layer(hidden_states)
+            
         return hidden_states
 
 class SigLipMLP(nn.Module):
@@ -133,8 +148,7 @@ class SigLipAttention(nn.Module):
         atten_output = self.out_proj(atten_output)
         
         return atten_output, atten_weights
-        
-             
+    
 class SiglipVisionTransformer(nn.Module):
     def __init__(self, config: SigLipVisionConfig):
         self.config = config
@@ -151,7 +165,7 @@ class SiglipVisionTransformer(nn.Module):
         return last_hidden_state
     
     
-    
+
 class SiglipVisionModel(nn.Module):
     def __init__(self, config: SigLipVisionConfig):
         self.config = config 
