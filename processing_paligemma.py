@@ -11,7 +11,7 @@ IMAGENET_STANDARD_STD = [0.5,0.5,0.5]
 
 def add_image_tokens_to_prompt(prefix_prompt, bos_token, image_seq_len, image_token):
     '''
-    Got this function from HiggingFace Blog https://huggingface.co/docs/transformers/en/model_doc/paligemma
+    Got this function from HuggingFace Blog https://huggingface.co/docs/transformers/en/model_doc/paligemma
     Detailed implementation on: https://github.com/huggingface/blog/blob/main/paligemma.md
     '''
     return f"{image_token * image_seq_len}{bos_token}{prefix_prompt}\n" 
