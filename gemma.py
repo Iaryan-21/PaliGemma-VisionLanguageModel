@@ -68,6 +68,41 @@ class PaliGemmaConfig():
         self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) **2  # Number of Image tokens we get. 
         self.vision_config.projection_dim = projection_dim 
 
+class KVCache():
+    def __init__(self) -> None:
+        self.key_cache : List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+    '''
+    Helper function that tells what the kv_cache contains. If it contains something then
+    return the number of items it stores. The sequence length is the second last dimension, therefore 
+    we return the -2. 
+    Shape of key_cache is [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+    '''
+    def num_items(self)-> int: 
+        if len(self.key_cache) == 0:
+            return 0
+        else:
+            return self.key_cache[0].shape[-2]
+    
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    '''
+    Add the contents of key_states and value_states of this indexed layer.
+    If neve anything has been added, we create this layer and if there is a token before
+    we concatenate along the kv cache and value cache along [Batch_size, Num_heads_KV, Seq_Len, Head_Dim]
+    '''
+    if len(self.key_cache) <= layer_idx:
+        self.key_cache.append(key_states)
+        self.value_cache.append(value_states)
+    else:
+        self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
+        self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
+
+    return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
 class GemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -76,12 +111,113 @@ class GemmaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim)) # dimensions to be as same as the tokens 
 
     def norm(self,x):
-        return x = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) #root mean square statistic 1/rms(ai)
+        x = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return  x #root mean square statistic 1/rms(ai)
         
     def forward(self, x):
         output = self._norm(x.float())
         output = output * (1.0+self.weight.float()) # Gamma Learnable parameter multiplcation
         return output.type_as(x) 
+
+
+class GemmaMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False) # Used by Activation function that Gemma model is using
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def forward(self,x):
+        y = self.gate_proj(x) # [Batch_size, Seq_len, Hidden_size] -> [Batch_size, Seq_len, Intermediate_Size]
+        y = torch.gelu(y,approximate="tanh") # [Batch_size, Seq_len, Intermediate_Size]
+        j = self.up_proj(x) # [Batch_size, Seq_len, Hidden_Size] -> [Batch_size, Seq_len, Intermediate_Size]
+        z = y * j # [Batch_size, Seq_len, Intermediate_Size]
+        z = self.down_proj(x) # [Batch_size, Seq_len, Intermediate_Size] -> [Batch_size, Seq_len, Hidden_Size]
+        return z
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:,:,None,:,:].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads, = n_rep, slen, head_dim)
+
+
+class GemmaAttention(nn.Module):
+    def __init__(self, config:GemmaConfig, layer_idx:Optional[int] = None):
+        super().__init__()
+        self.config = config 
+        self.layer_idx = layer_idx # Layer Index to know which KV Cache is to be used 
+
+        self.attention_dropout = config.attention_dropout 
+        self.hidden_size = config.hidden_size # size of embedding vector of each token
+        self.num_heads = config.num_attention_heads 
+        self.head_dim = config.head_dim # NUmber of dimensions each head will work with in MultiHeadAttention 
+        self.num_key_value_heads = config.num_key_value_heads # heads for keys and values 
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads # groups for keys and values 
+        self.max_position_embeddings = config.max_position_embeddings # Positions that can be encoded in the positional encoding 
+        self.rope_theta = config.rope_theta # Base Freq of ROPE 
+        self.is_causal = True 
+
+        assert self.hidden_size % self.num_heads == 0
+
+        # For grouped query attention we have less heads for key and values which leads to smaller projection for the mebdding of each 
+        # token when it is used as keys and values
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            kv_cache: Optional[KV_Cache] = None,
+            **kwargs
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1,2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1,2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1,2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids, Seq_len=None)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if kv_cache is not None:
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
+        
+        key_states = repeat_kv(key_states, self.num_key_value_groups) # Repeates the dimensions of key and valye which are not present for the current query heads. 
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2,3)) / math.sqrt(self.head_dim) # Attention
+
+        assert attention_mask is not None
+        attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, triaining = self.triaining)
+
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"attn_output" is of the size " f"{attn_output.size()}"
+                f"Needs to be: {(bsz, self.num_heads, q_len, self.head_dim)}"
+            )
+        
+        attn_output = attn_output.transpose(1,2).contiguous() # The seq len should be the second dimension
+        attn_output = attn_output.view(bsz, qlen, -1) # Concatenating all heads togethe.
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, attn_weights
 
 class GemmaDecoderLayer(nn.Module):
     def __init__(self, config:GemmaConfig, layer_idx: int):
@@ -180,7 +316,7 @@ class GemmaForCausalLM(nn.Module):
         kv_cache: Optional[KVCache] = None
         ) -> Tuple:
 
-        outputs = self.model(attention_mask = attention_mask, position_ids = position_ids, input_embeds=input_embeds, kv_cache=kv_cache)
+        outputs = self.model(attention_mask = attention_mask, position_ids = position_ids, input_embeds=inputs_embeds, kv_cache=kv_cache)
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
         logits = logits.float()
@@ -248,7 +384,7 @@ class PaliGemmaConditionalGeneration(nn.Module):
         final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)  # copy from scaled_image_features where image_mask_explained is true
         final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding) # wherever the pad_masked_expaneded is true keep them as zero embeddings or keep the final embeddings as they are 
 
-        dtype , device = inputs_embeds.dtype, input_embeds.device
+        dtype , device = input_embeds.dtype, input_embeds.device
         min_dtype = torch.finfo(dtype).min
         q_len = input_embeds.shape[1]
         '''
@@ -272,7 +408,6 @@ class PaliGemmaConditionalGeneration(nn.Module):
         In this way, the information about the prompt is replicated in each of this token. Included information about future tokens that are part of the prompt.
         When working with KVCache during inference we don't have a causal mask
         '''
-
         # Positions of  tokens used by the Rotatory Position Encodings
 
         if kv_cache is not None and kv_cache.num_items() > 0 : # N tokens that are part of the prompt of the user
@@ -280,15 +415,9 @@ class PaliGemmaConditionalGeneration(nn.Module):
             if position_ids.dim() == 1:
                 position_ids = position_ids.unsqueeze(0) # 
             else:
-                position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask == 0), 1).to(device) 
-                # This will generate one single mask which is the position corresponding to the last token. 
+                position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask == 0), 1).to(device)  # This will generate one single mask which is the position corresponding to the last token. 
+               
         return final_embedding, causal_mask, position_ids
-
-
-
-
-        
-            
 
     def forward(self, input_ids: torch.LongTensor = None, pixel_values: torch.FloatTensor = None, attention_mask: Optional[torch.Tensor]= None, kv_cache: Optional[KVCache] = None) -> Tuple:
         '''
