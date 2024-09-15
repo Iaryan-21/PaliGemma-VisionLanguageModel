@@ -1,11 +1,11 @@
 #!/bin/bash
 MODEL_PATH="paligemma-3b-pt-224"
-PROMPT="Tell me about this image  "
+PROMPT="What color is the road"
 IMAGE_FILE_PATH="/home/amishr17/Desktop/PaliGema_VLM/test_image/test_2.jpeg"
-MAX_TOKENS_TO_GENERATE=200
-TEMPERATURE=0.5
-TOP_P=0.9
-DO_SAMPLE="True"
+MAX_TOKENS_TO_GENERATE=500
+TEMPERATURE=0.2
+TOP_P=0.92
+DO_SAMPLE="False"
 ONLY_CPU="True"
 
 python inference.py \
