@@ -1,4 +1,4 @@
-# PaliGemma Vision-Language Model Repository
+# PaliGemma Vision-Language Model 
 
 ## Overview
 
